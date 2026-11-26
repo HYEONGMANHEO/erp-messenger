@@ -25,8 +25,8 @@
 필요한 것은 [Node.js](https://nodejs.org/ko) 22.13 이상 하나입니다.
 
 ```bash
-git clone <이 저장소의 주소>
-cd <내려받은 폴더>
+git clone https://github.com/HYEONGMANHEO/erp-messenger.git
+cd erp-messenger
 npm install --omit=dev
 npm start
 ```
