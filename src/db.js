@@ -68,7 +68,111 @@ function open(dataDir) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, id);
+
+    -- 알림
+    CREATE TABLE IF NOT EXISTS notifications (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES users(id),
+      type       TEXT NOT NULL,
+      title      TEXT NOT NULL,
+      body       TEXT NOT NULL DEFAULT '',
+      link       TEXT NOT NULL DEFAULT '',          -- 예: 'approval:12', 'board:5'
+      is_read    INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, id);
+
+    -- 게시판
+    CREATE TABLE IF NOT EXISTS posts (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      category   TEXT NOT NULL,                     -- 'notice' 또는 'general'
+      title      TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      user_id    INTEGER NOT NULL REFERENCES users(id),
+      pinned     INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category, id);
+    CREATE TABLE IF NOT EXISTS comments (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      post_id    INTEGER NOT NULL REFERENCES posts(id),
+      user_id    INTEGER NOT NULL REFERENCES users(id),
+      content    TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, id);
+
+    -- 전자결재
+    CREATE TABLE IF NOT EXISTS approvals (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      type         TEXT NOT NULL,                   -- 'general', 'expense', 'leave'
+      title        TEXT NOT NULL,
+      content      TEXT NOT NULL DEFAULT '',
+      amount       INTEGER,
+      drafter_id   INTEGER NOT NULL REFERENCES users(id),
+      status       TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected', 'withdrawn'
+      current_step INTEGER NOT NULL DEFAULT 1,
+      created_at   TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_approvals_drafter ON approvals(drafter_id, id);
+    CREATE TABLE IF NOT EXISTS approval_steps (
+      approval_id INTEGER NOT NULL REFERENCES approvals(id),
+      step_no     INTEGER NOT NULL,
+      approver_id INTEGER NOT NULL REFERENCES users(id),
+      status      TEXT NOT NULL DEFAULT 'waiting',  -- 'waiting', 'pending', 'approved', 'rejected'
+      comment     TEXT NOT NULL DEFAULT '',
+      acted_at    TEXT,
+      PRIMARY KEY (approval_id, step_no)
+    );
+    CREATE INDEX IF NOT EXISTS idx_steps_approver ON approval_steps(approver_id, status);
+
+    -- 근태와 휴가
+    CREATE TABLE IF NOT EXISTS attendance (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id   INTEGER NOT NULL REFERENCES users(id),
+      work_date TEXT NOT NULL,                      -- 'YYYY-MM-DD'
+      check_in  TEXT NOT NULL,
+      check_out TEXT,
+      UNIQUE (user_id, work_date)
+    );
+    CREATE TABLE IF NOT EXISTS leave_requests (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id     INTEGER NOT NULL REFERENCES users(id),
+      type        TEXT NOT NULL,                    -- 'annual', 'half_am', 'half_pm', 'sick', 'etc'
+      start_date  TEXT NOT NULL,
+      end_date    TEXT NOT NULL,
+      days        REAL NOT NULL,
+      reason      TEXT NOT NULL DEFAULT '',
+      status      TEXT NOT NULL DEFAULT 'pending',
+      approval_id INTEGER REFERENCES approvals(id),
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_leaves_user ON leave_requests(user_id, start_date);
+
+    -- 일정
+    CREATE TABLE IF NOT EXISTS events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      title       TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      location    TEXT NOT NULL DEFAULT '',
+      start_at    TEXT NOT NULL,                    -- 'YYYY-MM-DDTHH:mm'
+      end_at      TEXT NOT NULL,
+      all_day     INTEGER NOT NULL DEFAULT 0,
+      scope       TEXT NOT NULL,                    -- 'personal', 'department', 'company'
+      department  TEXT NOT NULL DEFAULT '',
+      user_id     INTEGER NOT NULL REFERENCES users(id),
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_range ON events(start_at, end_at);
   `);
+
+  // 이전 버전에서 만든 데이터베이스에 새 항목을 추가한다 (기존 데이터는 그대로 유지).
+  const userColumns = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!userColumns.includes('annual_leave_days')) {
+    db.exec('ALTER TABLE users ADD COLUMN annual_leave_days REAL NOT NULL DEFAULT 15');
+  }
 
   // 여러 쓰기 작업을 하나의 단위로 묶는 간단한 트랜잭션 도우미
   db.tx = (fn) => {

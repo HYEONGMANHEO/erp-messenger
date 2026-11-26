@@ -12,8 +12,16 @@
     tab: 'rooms',
     query: '',
     results: null,
+    view: 'home',            // 현재 화면 (home, chat, board, approval, attendance, calendar)
+    viewParams: null,
+    notifications: [],
+    notifUnread: 0,
+    approvalTodo: 0,         // 내가 결재할 문서 수
   };
   let socket = null;
+  // 다른 모듈(게시판, 결재, 근태, 일정)이 함께 쓰는 공용 기능 모음
+  const App = window.App = { state, views: [] };
+  App.registerView = (view) => { App.views.push(view); App.views.sort((a, b) => a.order - b.order); };
   const $app = document.getElementById('app');
   const $modalRoot = document.getElementById('modal-root');
   const $toast = document.getElementById('toast');
@@ -81,16 +89,16 @@
   const avatar = (text, extra = '') => h('span', { class: `avatar ${extra}` }, (text || '?').trim().charAt(0));
 
   // ───────────────────────── 모달 ─────────────────────────
-  function openModal(title, body, actions = []) {
+  function openModal(title, body, actions = [], options = {}) {
     const close = () => overlay.remove();
     const overlay = h('div', { class: 'overlay', onmousedown: (e) => { if (e.target === overlay) close(); } },
-      h('div', { class: 'modal', role: 'dialog', 'aria-label': title },
+      h('div', { class: options.wide ? 'modal wide' : 'modal', role: 'dialog', 'aria-label': title },
         h('div', { class: 'modal-head' }, h('h2', null, title), h('button', { class: 'icon-btn', onclick: close, 'aria-label': '닫기' }, '×')),
         h('div', { class: 'modal-body' }, body),
         actions.length ? h('div', { class: 'modal-foot' }, actions.map((a) =>
           h('button', { class: a.primary ? 'btn primary' : 'btn', onclick: guard(() => a.run(close)) }, a.label))) : null));
     $modalRoot.append(overlay);
-    overlay.querySelector('input, textarea')?.focus();
+    if (!options.noFocus) overlay.querySelector('input, textarea')?.focus();
     return close;
   }
 
@@ -113,7 +121,7 @@
 
   // ───────────────────────── 로그인 화면 ─────────────────────────
   function renderAuth(mode = state.config.firstUser ? 'signup' : 'login') {
-    document.title = '사내 메신저';
+    document.title = '사내 ERP';
     const isSignup = mode === 'signup';
     const field = (name, label, type = 'text', extra = {}) =>
       h('label', { class: 'field' }, h('span', null, label), h('input', { class: 'input', name, type, ...extra }));
@@ -127,7 +135,7 @@
         await enterApp(user);
       }),
     },
-      h('h1', null, '사내 메신저'),
+      h('h1', null, '사내 ERP'),
       h('p', { class: 'muted' }, isSignup
         ? (state.config.firstUser ? '첫 번째 가입자는 관리자 계정이 됩니다.' : '계정을 만들어 주세요.')
         : '아이디와 비밀번호를 입력해 주세요.'),
@@ -149,31 +157,113 @@
   }
 
   // ───────────────────────── 메인 화면 ─────────────────────────
-  let $sidebar; let $main;
+  let $sidebar; let $main; let $rail; let $view;
   function renderShell() {
-    $sidebar = h('aside', { class: 'sidebar' });
-    $main = h('main', { class: 'main' });
+    $rail = h('nav', { class: 'rail', 'aria-label': '주 메뉴' });
+    $view = h('div', { class: 'view' });
     $app.className = 'shell';
-    $app.replaceChildren($sidebar, $main);
-    renderSidebar();
-    renderMain();
+    $app.replaceChildren($rail, $view);
+    renderView();
   }
 
+  // 선택된 화면을 그린다. 각 화면은 registerView 로 등록된 모듈이 담당한다.
+  function renderView() {
+    if (!$view) return;
+    const view = App.views.find((v) => v.id === state.view) || App.views[0];
+    state.view = view.id;
+    $sidebar = $main = $messages = $chatHead = $input = null;
+    $app.classList.remove('chat-open');
+    $view.className = `view view-${view.id}`;
+    $view.replaceChildren();
+    renderRail();
+    const params = state.viewParams || {};
+    state.viewParams = null;
+    view.render($view, params);
+  }
+  App.go = (id, params) => { state.view = id; state.viewParams = params || null; renderView(); };
+
+  function renderRail() {
+    const chatUnread = totalUnread();
+    const all = chatUnread + state.notifUnread;
+    document.title = all ? `(${all}) 사내 ERP` : '사내 ERP';
+    if (!$rail) return;
+    const badge = (n) => (n ? h('span', { class: 'badge' }, n > 99 ? '99+' : n) : null);
+    const item = (label, onclick, count, active) =>
+      h('button', { class: active ? 'rail-item on' : 'rail-item', onclick }, h('span', null, label), badge(count));
+    $rail.replaceChildren(
+      h('div', { class: 'rail-main' }, App.views.map((v) => item(v.label, () => App.go(v.id), v.badge ? v.badge() : 0, v.id === state.view))),
+      h('div', { class: 'rail-sub' }, [
+        item('알림', openNotifications, state.notifUnread),
+        item('설정', openSettingsModal),
+        state.me.role === 'admin' ? item('관리', openAdminModal) : null,
+        item('로그아웃', guard(logout)),
+      ].filter(Boolean)));
+  }
+  App.renderRail = renderRail;
+
+  App.registerView({
+    id: 'chat', label: '메신저', order: 20, badge: () => totalUnread(),
+    render(el) {
+      $sidebar = h('aside', { class: 'sidebar' });
+      $main = h('main', { class: 'main' });
+      el.append($sidebar, $main);
+      renderSidebar();
+      renderMain();
+    },
+  });
+
+  // 알림의 link 값('board:5', 'approval:12')에 맞는 화면으로 이동한다.
+  function openLink(link) {
+    const [kind, id] = String(link).split(':');
+    if (kind === 'board') App.go('board', { postId: Number(id) });
+    else if (kind === 'approval') { App.go('approval'); App.openApproval?.(Number(id)); }
+  }
+
+  function openNotifications() {
+    const list = h('div', { class: 'notif-list' });
+    let close = () => {};
+    const draw = () => list.replaceChildren(...(state.notifications.length ? state.notifications.map((n) =>
+      h('button', {
+        class: n.read ? 'notif' : 'notif unread',
+        onclick: guard(async () => {
+          if (!n.read) { await api('POST', '/api/notifications/read', { id: n.id }); n.read = true; state.notifUnread = Math.max(0, state.notifUnread - 1); renderRail(); }
+          close();
+          openLink(n.link);
+        }),
+      }, h('div', { class: 'item-top' }, h('strong', null, n.title), h('span', { class: 'muted small' }, shortTime(n.createdAt))),
+      h('div', { class: 'item-sub wrap' }, n.body))) : [h('p', { class: 'empty' }, '알림이 없습니다.')]));
+    draw();
+    close = openModal('알림', list, [{
+      label: '모두 읽음', run: async () => {
+        await api('POST', '/api/notifications/read', {});
+        state.notifications.forEach((n) => { n.read = true; });
+        state.notifUnread = 0;
+        renderRail();
+        draw();
+      },
+    }], { noFocus: true });
+  }
+
+  async function refreshCounts() {
+    const [notif, todo] = await Promise.all([api('GET', '/api/notifications'), api('GET', '/api/approvals?box=todo')]);
+    state.notifications = notif.notifications;
+    state.notifUnread = notif.unread;
+    state.approvalTodo = todo.todoCount;
+    renderRail();
+  }
+  App.refreshCounts = refreshCounts;
+
   function renderSidebar() {
+    renderRail();
     if (!$sidebar) return;
     const me = state.me;
     const unread = totalUnread();
-    document.title = unread ? `(${unread}) 사내 메신저` : '사내 메신저';
     const hadFocus = document.activeElement?.id === 'search';
 
     const head = h('div', { class: 'side-head' },
       h('div', { class: 'me' }, avatar(me.name), h('div', null, h('strong', null, me.name),
         h('div', { class: 'muted small' }, [me.department, me.position].filter(Boolean).join(' · ') || me.username))),
-      h('div', { class: 'side-actions' },
-        h('button', { class: 'btn small', onclick: openGroupModal }, '새 그룹'),
-        h('button', { class: 'btn small', onclick: openSettingsModal }, '설정'),
-        me.role === 'admin' && h('button', { class: 'btn small', onclick: openAdminModal }, '관리'),
-        h('button', { class: 'btn small', onclick: guard(logout) }, '로그아웃')));
+      h('button', { class: 'btn small', onclick: openGroupModal }, '새 그룹'));
 
     const search = h('input', { id: 'search', class: 'input', type: 'search', placeholder: '메시지 검색 (2자 이상)', value: state.query, oninput: onSearchInput });
 
@@ -261,7 +351,8 @@
 
   function renderMain() {
     const room = state.rooms.get(state.currentRoomId);
-    $app.classList.toggle('chat-open', !!room);
+    $app.classList.toggle('chat-open', !!room && !!$main);
+    if (!$main) return;
     if (!room) {
       $messages = $chatHead = $input = null;
       $main.replaceChildren(h('div', { class: 'placeholder' }, h('h2', null, '사내 메신저'), h('p', { class: 'muted' }, '왼쪽에서 대화방을 선택하거나 조직도에서 동료를 선택해 주세요.')));
@@ -379,8 +470,8 @@
     if (!state.rooms.has(roomId)) return;
     state.currentRoomId = roomId;
     state.tab = 'rooms';
-    renderMain();
-    renderSidebar();
+    if (state.view !== 'chat') App.go('chat');
+    else { renderMain(); renderSidebar(); }
     if (!state.msgs.get(roomId)?.loaded) await loadMessages(roomId);
     if (state.currentRoomId !== roomId) return;
     renderMessages(true);
@@ -390,7 +481,7 @@
   function markCurrentRead() {
     const room = state.rooms.get(state.currentRoomId);
     const store = state.msgs.get(state.currentRoomId);
-    if (!room || !store?.list.length || document.hidden || !document.hasFocus()) return;
+    if (state.view !== 'chat' || !room || !store?.list.length || document.hidden || !document.hasFocus()) return;
     const lastId = store.list[store.list.length - 1].id;
     const mine = room.members.find((m) => m.userId === state.me.id);
     if (mine && mine.lastReadId >= lastId) return;
@@ -523,6 +614,7 @@
     socket.on('connect', guard(async () => {
       if (first) { first = false; return; }
       await loadAll(); // 연결이 끊겼다가 복구되면 놓친 내용을 다시 불러온다.
+      await refreshCounts();
       if (state.currentRoomId) { await loadMessages(state.currentRoomId); renderMessages(true); }
     }));
     socket.on('connect_error', (err) => { if (err.message === 'unauthorized') leaveApp(); });
@@ -565,8 +657,21 @@
     socket.on('room:removed', ({ roomId }) => {
       state.rooms.delete(roomId);
       state.msgs.delete(roomId);
-      if (state.currentRoomId === roomId) { state.currentRoomId = null; renderMain(); }
+      if (state.currentRoomId === roomId) { state.currentRoomId = null; if ($main) renderMain(); }
       renderSidebar();
+    });
+
+    socket.on('notify', (n) => {
+      state.notifications.unshift(n);
+      state.notifications.length = Math.min(state.notifications.length, 50);
+      state.notifUnread += 1;
+      if (n.type === 'approval') refreshCounts().catch(() => {});
+      else renderRail();
+      toast(`${n.title}: ${n.body}`);
+      if ('Notification' in window && Notification.permission === 'granted' && (document.hidden || !document.hasFocus())) {
+        const popup = new Notification(n.title, { body: n.body, tag: `notify-${n.id}` });
+        popup.onclick = () => { window.focus(); openLink(n.link); popup.close(); };
+      }
     });
 
     socket.on('presence', ({ userId, online }) => {
@@ -598,7 +703,9 @@
 
   async function enterApp(user) {
     state.me = user;
+    state.view = 'home';
     await loadAll();
+    await refreshCounts();
     renderShell();
     connectSocket();
   }
@@ -606,8 +713,11 @@
   function leaveApp() {
     socket?.disconnect();
     socket = null;
-    Object.assign(state, { me: null, users: new Map(), rooms: new Map(), msgs: new Map(), currentRoomId: null, query: '', results: null });
-    $sidebar = $main = null;
+    Object.assign(state, {
+      me: null, users: new Map(), rooms: new Map(), msgs: new Map(), currentRoomId: null, query: '', results: null,
+      notifications: [], notifUnread: 0, approvalTodo: 0, view: 'home', viewParams: null,
+    });
+    $sidebar = $main = $rail = $view = null;
     $modalRoot.replaceChildren();
     api('GET', '/api/config').then((config) => { state.config = config; renderAuth('login'); }).catch(() => renderAuth('login'));
   }
@@ -617,7 +727,60 @@
     leaveApp();
   }
 
-  (async () => {
+  // ───────────────────────── 모듈 공용 기능 ─────────────────────────
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const dateTime = (iso) => { const d = new Date(iso); return `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const userLabel = (id) => { const u = state.users.get(id); return u ? [u.name, u.position].filter(Boolean).join(' ') : '알 수 없음'; };
+
+  // 화면 공통 틀: 제목, 오른쪽 버튼, 본문
+  function page(title, actions, ...body) {
+    return h('div', { class: 'page' },
+      h('header', { class: 'page-head' }, h('h1', null, title), h('div', { class: 'page-actions' }, actions || [])),
+      h('div', { class: 'page-body' }, body));
+  }
+  function tabs(items, current, onSelect) {
+    return h('div', { class: 'tabs inline' }, items.map(([id, label, count]) =>
+      h('button', { class: id === current ? 'tab on' : 'tab', onclick: () => onSelect(id) }, label,
+        count ? h('span', { class: 'badge' }, count) : null)));
+  }
+  const STATUS = { pending: ['진행 중', 'wait'], approved: ['승인', 'ok'], rejected: ['반려', 'no'], withdrawn: ['회수', 'off'], waiting: ['대기', 'off'] };
+  const statusChip = (status) => h('span', { class: `chip ${STATUS[status]?.[1] || 'off'}` }, STATUS[status]?.[0] || status);
+
+  // 결재선 선택: 순서대로 추가하며, 마지막으로 쓴 결재선을 이 브라우저에 기억한다.
+  function approverPicker() {
+    let ids = [];
+    try { ids = JSON.parse(localStorage.getItem(`approvers:${state.me.id}`) || '[]'); } catch { ids = []; }
+    ids = ids.filter((id) => state.users.get(id)?.active && id !== state.me.id).slice(0, 5);
+    const list = h('ol', { class: 'approver-list' });
+    const select = h('select', { class: 'input' });
+    const draw = () => {
+      list.replaceChildren(...(ids.length ? ids.map((id, i) => h('li', null, h('span', null, `${i + 1}차 결재: ${userLabel(id)}`),
+        h('button', { class: 'link small', type: 'button', onclick: () => { ids.splice(i, 1); draw(); } }, '삭제')))
+        : [h('li', { class: 'muted' }, '결재자를 순서대로 추가해 주세요.')]));
+      const candidates = [...state.users.values()].filter((u) => u.active && u.id !== state.me.id && !ids.includes(u.id));
+      select.replaceChildren(h('option', { value: '' }, '결재자 선택'), ...candidates.map((u) =>
+        h('option', { value: u.id }, `${u.name}${u.position ? ` ${u.position}` : ''}${u.department ? ` (${u.department})` : ''}`)));
+    };
+    select.addEventListener('change', () => {
+      const id = Number(select.value);
+      if (!id) return;
+      if (ids.length >= 5) { toast('결재자는 5명까지 지정할 수 있습니다.'); select.value = ''; return; }
+      ids.push(id);
+      draw();
+    });
+    draw();
+    return {
+      node: h('div', { class: 'field' }, h('span', null, '결재선 (위에서부터 순서대로 결재)'), list, select),
+      ids: () => { try { localStorage.setItem(`approvers:${state.me.id}`, JSON.stringify(ids)); } catch { /* 저장 실패는 무시 */ } return [...ids]; },
+    };
+  }
+
+  Object.assign(App, {
+    h, api, guard, toast, openModal, page, tabs, statusChip, approverPicker, linkify, avatar,
+    userName, userLabel, ymd, dateTime, timeOf, shortTime, dayLabel, openRoom,
+  });
+
+  window.addEventListener('DOMContentLoaded', async () => {
     try {
       state.config = await api('GET', '/api/config');
       const res = await fetch('/api/me', { credentials: 'same-origin' });
@@ -626,5 +789,5 @@
     } catch (err) {
       $app.replaceChildren(h('p', { class: 'empty' }, '서버에 연결하지 못했습니다. 잠시 후 새로 고침해 주세요.'));
     }
-  })();
+  });
 })();

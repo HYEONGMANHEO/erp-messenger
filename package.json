@@ -1,7 +1,7 @@
 {
   "name": "erp-messenger",
-  "version": "0.1.0",
-  "description": "사내 ERP의 첫 번째 모듈인 사내 메신저 (설치형, 웹 기반)",
+  "version": "0.2.0",
+  "description": "설치형 사내 ERP (메신저, 게시판, 전자결재, 근태·휴가, 일정)",
   "main": "server.js",
   "license": "MIT",
   "private": true,

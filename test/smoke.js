@@ -171,6 +171,175 @@ async function main() {
       assert.ok(older.messages.at(-1).id < first.messages[0].id);
     });
 
+    // ───────────── ERP 모듈 ─────────────
+    const d = client(); let D;
+    const notifications = async (c0) => (await c0.call('GET', '/api/notifications')).data;
+    const addDays = (date, n) => { const x = new Date(`${date}T00:00:00Z`); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+    let todayStr; let monday; let noticeId; let docId;
+
+    await step('게시판: 공지는 관리자만 작성하고 전 직원에게 알림이 간다', async () => {
+      D = (await d.call('POST', '/api/signup', { username: 'choi', password: 'password4', name: '최주임', department: '개발', signupCode: 'code-1234' })).data.user;
+      assert.equal((await b.call('POST', '/api/posts', { category: 'notice', title: '공지', content: '내용' })).status, 403);
+      sb.events.length = 0;
+      const r = await a.call('POST', '/api/posts', { category: 'notice', title: '연말 일정 안내', content: '12월 31일은 휴무입니다.', pinned: true });
+      assert.equal(r.status, 200); noticeId = r.data.post.id;
+      await sleep(150);
+      assert.ok(sb.events.some((e) => e.name === 'notify' && e.data.link === `board:${noticeId}`));
+      const list = (await b.call('GET', '/api/posts?category=notice')).data;
+      assert.equal(list.total, 1); assert.equal(list.posts[0].pinned, true);
+    });
+    await step('게시판: 댓글, 수정, 삭제 권한이 지켜진다', async () => {
+      const cm = await b.call('POST', `/api/posts/${noticeId}/comments`, { content: '확인했습니다.' });
+      assert.equal(cm.status, 200);
+      assert.equal((await b.call('GET', `/api/posts/${noticeId}`)).data.comments.length, 1);
+      assert.equal((await c.call('DELETE', `/api/comments/${cm.data.comment.id}`)).status, 403);
+      assert.equal((await b.call('PATCH', `/api/posts/${noticeId}`, { title: '변조', content: '변조' })).status, 403);
+      const mine = (await b.call('POST', '/api/posts', { category: 'general', title: '점심 추천', content: '국밥', pinned: true })).data.post;
+      assert.equal(mine.pinned, false);
+      assert.equal((await b.call('PATCH', `/api/posts/${mine.id}`, { title: '점심 추천 수정', content: '칼국수' })).data.post.title, '점심 추천 수정');
+      assert.equal((await c.call('DELETE', `/api/posts/${mine.id}`)).status, 403);
+      assert.equal((await a.call('DELETE', `/api/posts/${mine.id}`)).status, 200);
+      assert.equal((await b.call('GET', `/api/posts/${mine.id}`)).status, 404);
+    });
+
+    await step('전자결재: 결재선 순서대로만 승인할 수 있다', async () => {
+      const base = { type: 'expense', title: '노트북 구매', content: '개발용 장비', amount: 2500000 };
+      assert.equal((await b.call('POST', '/api/approvals', { ...base, approverIds: [] })).status, 400);
+      assert.equal((await b.call('POST', '/api/approvals', { ...base, approverIds: [B.id] })).status, 400);
+      assert.equal((await b.call('POST', '/api/approvals', { ...base, approverIds: [C.id, C.id] })).status, 400);
+      assert.equal((await b.call('POST', '/api/approvals', { ...base, amount: -5, approverIds: [C.id] })).status, 400);
+      const r = await b.call('POST', '/api/approvals', { ...base, approverIds: [C.id, A.id] });
+      assert.equal(r.status, 200); docId = r.data.approval.id;
+      assert.equal(r.data.approval.currentApproverId, C.id);
+      assert.equal((await a.call('POST', `/api/approvals/${docId}/act`, { action: 'approve' })).status, 403);
+      assert.equal((await b.call('POST', `/api/approvals/${docId}/act`, { action: 'approve' })).status, 403);
+      assert.equal((await d.call('GET', `/api/approvals/${docId}`)).status, 403);
+      assert.equal((await c.call('GET', '/api/approvals?box=todo')).data.todoCount, 1);
+      assert.equal((await a.call('GET', '/api/approvals?box=todo')).data.todoCount, 0);
+      const first = await c.call('POST', `/api/approvals/${docId}/act`, { action: 'approve', comment: '확인' });
+      assert.equal(first.data.approval.status, 'pending'); assert.equal(first.data.approval.currentApproverId, A.id);
+      assert.equal((await c.call('POST', `/api/approvals/${docId}/act`, { action: 'approve' })).status, 403);
+      const last = await a.call('POST', `/api/approvals/${docId}/act`, { action: 'approve' });
+      assert.equal(last.data.approval.status, 'approved');
+      assert.equal((await a.call('POST', `/api/approvals/${docId}/act`, { action: 'approve' })).status, 400);
+      const note = (await notifications(b)).notifications.find((n) => n.link === `approval:${docId}`);
+      assert.equal(note.title, '결재 승인 완료');
+    });
+    await step('전자결재: 반려에는 사유가 필요하고 회수한 문서는 결재할 수 없다', async () => {
+      const mk = async () => (await b.call('POST', '/api/approvals', { type: 'general', title: '외부 교육 참가', content: '교육 신청', approverIds: [C.id] })).data.approval.id;
+      const id1 = await mk();
+      assert.equal((await c.call('POST', `/api/approvals/${id1}/act`, { action: 'reject' })).status, 400);
+      assert.equal((await c.call('POST', `/api/approvals/${id1}/act`, { action: 'reject', comment: '예산 부족' })).data.approval.status, 'rejected');
+      const id2 = await mk();
+      assert.equal((await c.call('POST', `/api/approvals/${id2}/withdraw`)).status, 403);
+      assert.equal((await b.call('POST', `/api/approvals/${id2}/withdraw`)).data.approval.status, 'withdrawn');
+      assert.equal((await c.call('POST', `/api/approvals/${id2}/act`, { action: 'approve' })).status, 400);
+      assert.equal((await b.call('GET', '/api/approvals?box=all')).status, 403);
+      assert.ok((await a.call('GET', '/api/approvals?box=all')).data.approvals.length >= 3);
+    });
+
+    await step('근태: 출근과 퇴근이 기록되고 중복 출근은 거부된다', async () => {
+      assert.equal((await c.call('POST', '/api/attendance/check-out')).status, 400);
+      const cin = await b.call('POST', '/api/attendance/check-in');
+      assert.equal(cin.status, 200); todayStr = cin.data.date;
+      assert.match(todayStr, /^\d{4}-\d{2}-\d{2}$/);
+      assert.equal((await b.call('POST', '/api/attendance/check-in')).status, 400);
+      const out = await b.call('POST', '/api/attendance/check-out');
+      assert.ok(out.data.record.checkOut);
+      assert.equal((await b.call('GET', '/api/attendance')).data.records.length, 1);
+      assert.equal((await b.call('GET', '/api/admin/attendance')).status, 403);
+      const all = (await a.call('GET', '/api/admin/attendance')).data.records;
+      assert.ok(all.find((r) => r.userId === B.id).checkIn);
+      assert.equal(all.find((r) => r.userId === C.id).checkIn, null);
+    });
+
+    await step('휴가: 신청은 결재로 올라가고 승인되면 연차가 차감된다', async () => {
+      monday = addDays(todayStr, ((8 - new Date(`${todayStr}T00:00:00Z`).getUTCDay()) % 7) || 7);
+      const year = monday.slice(0, 4);
+      const before = (await b.call('GET', `/api/leaves?year=${year}`)).data.balance;
+      assert.equal(before.total, 15); assert.equal(before.remaining, 15);
+      const weekend = await b.call('POST', '/api/leaves', { type: 'annual', startDate: addDays(monday, 5), endDate: addDays(monday, 6), approverIds: [A.id] });
+      assert.equal(weekend.status, 400);
+      const req = await b.call('POST', '/api/leaves', { type: 'annual', startDate: monday, endDate: addDays(monday, 2), reason: '가족 여행', approverIds: [A.id] });
+      assert.equal(req.status, 200); assert.equal(req.data.leave.days, 3); assert.equal(req.data.leave.status, 'pending');
+      const mid = (await b.call('GET', `/api/leaves?year=${year}`)).data.balance;
+      assert.equal(mid.pending, 3); assert.equal(mid.remaining, 12);
+      const dup = await b.call('POST', '/api/leaves', { type: 'half_am', startDate: addDays(monday, 1), approverIds: [A.id] });
+      assert.equal(dup.status, 400);
+      assert.equal((await a.call('GET', `/api/leaves/calendar?from=${monday}&to=${addDays(monday, 6)}`)).data.leaves.length, 0);
+      await a.call('POST', `/api/approvals/${req.data.leave.approvalId}/act`, { action: 'approve' });
+      const after = (await b.call('GET', `/api/leaves?year=${year}`)).data;
+      assert.equal(after.leaves[0].status, 'approved'); assert.equal(after.balance.used, 3); assert.equal(after.balance.pending, 0);
+      assert.equal((await d.call('GET', `/api/leaves/calendar?from=${monday}&to=${addDays(monday, 6)}`)).data.leaves[0].userId, B.id);
+    });
+    await step('휴가: 반차, 잔여 부족, 반려와 회수가 올바르게 처리된다', async () => {
+      const year = monday.slice(0, 4);
+      const half = await b.call('POST', '/api/leaves', { type: 'half_pm', startDate: addDays(monday, 4), endDate: addDays(monday, 30), approverIds: [A.id] });
+      assert.equal(half.data.leave.days, 0.5); assert.equal(half.data.leave.endDate, addDays(monday, 4));
+      await a.call('POST', `/api/approvals/${half.data.leave.approvalId}/act`, { action: 'reject', comment: '일정 조정 필요' });
+      const afterReject = (await b.call('GET', `/api/leaves?year=${year}`)).data;
+      assert.equal(afterReject.leaves.find((l) => l.id === half.data.leave.id).status, 'rejected');
+      assert.equal(afterReject.balance.remaining, 12);
+      assert.equal((await b.call('PATCH', `/api/admin/users/${B.id}/leave`, { annualLeaveDays: 30 })).status, 403);
+      assert.equal((await a.call('PATCH', `/api/admin/users/${B.id}/leave`, { annualLeaveDays: 3.3 })).status, 400);
+      assert.equal((await a.call('PATCH', `/api/admin/users/${B.id}/leave`, { annualLeaveDays: 3.5 })).data.balance.remaining, 0.5);
+      const over = await b.call('POST', '/api/leaves', { type: 'annual', startDate: addDays(monday, 7), endDate: addDays(monday, 7), approverIds: [A.id] });
+      assert.equal(over.status, 400);
+      const sick = await b.call('POST', '/api/leaves', { type: 'sick', startDate: addDays(monday, 7), endDate: addDays(monday, 8), approverIds: [A.id] });
+      assert.equal(sick.status, 200);
+      await b.call('POST', `/api/approvals/${sick.data.leave.approvalId}/withdraw`);
+      assert.equal((await b.call('GET', `/api/leaves?year=${year}`)).data.leaves.find((l) => l.id === sick.data.leave.id).status, 'withdrawn');
+      assert.equal((await a.call('GET', `/api/admin/leaves?year=${year}`)).data.balances.find((x) => x.userId === B.id).used, 3);
+    });
+
+    await step('일정: 공개 범위에 따라 보이는 사람이 달라진다', async () => {
+      const range = `/api/events?from=${monday}&to=${addDays(monday, 6)}`;
+      const mk = (cl, body) => cl.call('POST', '/api/events', { title: '회의', startAt: `${monday}T10:00`, endAt: `${monday}T11:00`, ...body });
+      assert.equal((await mk(b, { scope: 'personal', startAt: `${monday}T12:00`, endAt: `${monday}T11:00` })).status, 400);
+      assert.equal((await mk(b, { scope: 'secret' })).status, 400);
+      assert.equal((await mk(c, { scope: 'department' })).status, 400); // 부서 정보가 없는 사용자
+      const personal = (await mk(b, { scope: 'personal', title: '개인 약속' })).data.event;
+      const dept = (await mk(b, { scope: 'department', title: '개발팀 주간회의' })).data.event;
+      const company = (await mk(b, { scope: 'company', title: '전사 워크숍', allDay: true, startAt: monday, endAt: addDays(monday, 1) })).data.event;
+      assert.equal(company.startAt, `${monday}T00:00`); assert.equal(company.endAt, `${addDays(monday, 1)}T23:59`);
+      const titles = async (cl) => (await cl.call('GET', range)).data.events.map((e) => e.title).sort();
+      assert.deepEqual(await titles(b), ['개발팀 주간회의', '개인 약속', '전사 워크숍'].sort());
+      assert.deepEqual(await titles(d), ['개발팀 주간회의', '전사 워크숍'].sort()); // 같은 부서
+      assert.deepEqual(await titles(c), ['전사 워크숍']);
+      assert.deepEqual(await titles(a), ['전사 워크숍']); // 관리자도 남의 개인 일정은 볼 수 없다
+      assert.equal((await c.call('DELETE', `/api/events/${company.id}`)).status, 403);
+      assert.equal((await a.call('DELETE', `/api/events/${personal.id}`)).status, 404);
+      const edited = await a.call('PATCH', `/api/events/${company.id}`, { title: '전사 워크숍 (변경)', scope: 'company', startAt: `${monday}T09:00`, endAt: `${monday}T18:00` });
+      assert.equal(edited.data.event.title, '전사 워크숍 (변경)');
+      assert.equal((await b.call('DELETE', `/api/events/${dept.id}`)).status, 200);
+      assert.equal((await b.call('GET', '/api/events?from=abc&to=def')).status, 400);
+    });
+
+    await step('알림: 내 알림만 조회되고 읽음 처리된다', async () => {
+      const mine = await notifications(b);
+      assert.ok(mine.unread > 0);
+      assert.ok(mine.notifications.every((n) => typeof n.title === 'string'));
+      await b.call('POST', '/api/notifications/read');
+      assert.equal((await notifications(b)).unread, 0);
+      assert.ok((await notifications(c)).unread > 0);
+    });
+    await step('이전 버전 데이터베이스가 자동으로 변환된다', async () => {
+      const { DatabaseSync } = require('node:sqlite');
+      const oldDir = fs.mkdtempSync(path.join(os.tmpdir(), 'messenger-old-'));
+      const old = new DatabaseSync(path.join(oldDir, 'messenger.db'));
+      old.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+        name TEXT NOT NULL, department TEXT NOT NULL DEFAULT '', position TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT 'user',
+        active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+        INSERT INTO users (username, password_hash, name, created_at) VALUES ('old', 'x', '기존 직원', '2026-01-01');`);
+      old.close();
+      const upgraded = require('../src/db').open(oldDir);
+      const row = upgraded.prepare('SELECT name, annual_leave_days FROM users').get();
+      assert.equal(row.name, '기존 직원'); assert.equal(row.annual_leave_days, 15);
+      upgraded.close();
+      require('../src/db').open(oldDir).close(); // 두 번 열어도 문제가 없어야 한다
+      fs.rmSync(oldDir, { recursive: true, force: true });
+    });
+
     await step('일반 사용자는 관리 기능을 사용할 수 없다', async () => {
       assert.equal((await b.call('PATCH', `/api/admin/users/${C.id}`, { active: false })).status, 403);
       assert.equal((await a.call('PATCH', `/api/admin/users/${A.id}`, { role: 'user' })).status, 400);

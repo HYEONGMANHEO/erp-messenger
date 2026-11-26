@@ -20,6 +20,7 @@ const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 20);
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 14);
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 const MAX_MESSAGE_LENGTH = 4000;
+const TIMEZONE = process.env.TIMEZONE || 'Asia/Seoul';
 const INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 const db = require('./src/db').open(DATA_DIR);
@@ -480,6 +481,47 @@ app.get('/api/search', auth, (req, res) => {
   `).all(req.user.id, pattern);
   res.json({ results: rows.map(messagePayload) });
 });
+
+// ── 알림 ──
+function notify(userIds, { type, title, body = '', link = '' }) {
+  const insert = db.prepare('INSERT INTO notifications (user_id, type, title, body, link, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  for (const userId of new Set(userIds)) {
+    const createdAt = now();
+    const id = Number(insert.run(userId, type, title, body, link, createdAt).lastInsertRowid);
+    emitToUser(userId, 'notify', { id, type, title, body, link, read: false, createdAt });
+  }
+}
+
+app.get('/api/notifications', auth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 50').all(req.user.id);
+  const unread = db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0').get(req.user.id).n;
+  res.json({
+    unread,
+    notifications: rows.map((n) => ({ id: n.id, type: n.type, title: n.title, body: n.body, link: n.link, read: !!n.is_read, createdAt: n.created_at })),
+  });
+});
+
+app.post('/api/notifications/read', auth, (req, res) => {
+  if (req.body.id) db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?').run(toId(req.body.id), req.user.id);
+  else db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.user.id);
+  res.json({ ok: true });
+});
+
+// ── ERP 모듈 (게시판, 전자결재, 근태·휴가, 일정) ──
+// 모든 모듈은 메신저와 같은 계정, 조직도, 알림 기능을 공유한다.
+const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+const ctx = {
+  app, db, auth, adminOnly, fail, toId, cleanText, now, notify, activeUsersByIds,
+  today: () => dateFormatter.format(new Date()),                         // 회사 기준 시간대의 오늘 날짜
+  isDate: (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+    && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value,
+  allActiveUserIds: () => db.prepare('SELECT id FROM users WHERE active = 1').all().map((u) => u.id),
+  hooks: { approvalChanged: [] },
+};
+require('./src/modules/board')(ctx);
+require('./src/modules/approval')(ctx);
+require('./src/modules/attendance')(ctx);
+require('./src/modules/calendar')(ctx);
 
 // ── 오류 처리 ──
 app.use('/api', (req, res) => res.status(404).json({ error: '존재하지 않는 주소입니다.' }));
