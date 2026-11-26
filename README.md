@@ -37,6 +37,34 @@ npm start
 
 깃허브 화면에서 Code 버튼의 Download ZIP으로 내려받아 압축을 푼 뒤 같은 명령을 실행해도 됩니다.
 
+## 윈도우에서 다시 실행하기
+
+한 번 설치한 뒤에는 폴더 안의 실행 파일을 더블클릭하면 됩니다.
+
+| 파일 | 용도 |
+|---|---|
+| `start-server.bat` | 메신저 서버만 실행 (같은 사내망에서 사용할 때) |
+| `start-with-tunnel.bat` | 메신저 서버와 외부 접속용 터널을 함께 실행 |
+
+명령어로 직접 실행하려면 cmd에서 폴더로 이동한 뒤 `npm start`를 입력합니다. PC를 껐다 켜도 계정과 대화 내용은 `data` 폴더에 그대로 남아 있습니다.
+
+## 외부에서 접속하기 (시험용 터널)
+
+서로 다른 장소에 있는 사람들과 시험해 보려면 [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)을 사용할 수 있습니다. 계정이나 도메인 없이 임시 HTTPS 주소가 만들어집니다.
+
+1. 터널 프로그램 설치 (한 번만): `winget install --id Cloudflare.cloudflared`
+2. `.env` 파일에 `SIGNUP_CODE`, `COOKIE_SECURE=true`, `TRUST_PROXY=true` 설정
+3. 터널을 열기 전에 `http://localhost:3000`에서 관리자 계정을 먼저 가입
+4. `start-with-tunnel.bat` 실행 (또는 서버 실행 후 다른 창에서 `cloudflared tunnel --url http://localhost:3000`)
+5. 화면에 표시된 `https://....trycloudflare.com` 주소와 가입 코드를 동료에게 공유
+
+유의 사항:
+
+- 터널을 다시 실행할 때마다 주소가 바뀝니다.
+- 서버 PC와 실행 창이 켜져 있는 동안에만 접속됩니다.
+- 주소를 아는 사람은 누구나 로그인 화면에 접근할 수 있으므로 가입 코드를 반드시 설정해 주세요.
+- 가동 시간이 보장되지 않는 시험용 서비스입니다. 계속 사용하려면 클라우드 서버에 설치하고 도메인과 HTTPS를 적용하는 구성을 권장합니다.
+
 ## 설정
 
 `.env.example` 파일을 `.env` 로 복사한 뒤 필요한 값을 수정합니다.
@@ -71,6 +99,8 @@ server.js        서버 (REST API, 실시간 통신, 권한 확인)
 src/db.js        데이터베이스 구조 정의
 public/          화면 (index.html, app.js, style.css)
 test/smoke.js    주요 기능 자동 점검 스크립트
+start-server.bat        윈도우용 서버 실행 파일
+start-with-tunnel.bat   윈도우용 서버와 터널 동시 실행 파일
 data/            실행 시 생성되는 데이터 폴더 (저장소에는 포함되지 않음)
 ```
 
